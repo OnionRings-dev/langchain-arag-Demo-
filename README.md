@@ -58,9 +58,3 @@ uv run python main.py
 ```
 
 Type `exit` or `quit` to stop the chat.
-
-### Scripts
-
-Utility scripts live in `scripts/` and read `QDRANT_URL`/`QDRANT_API_KEY` from `.env`.
-For example: `uv run python scripts/qdrant_collections_rows.py` and
-`uv run python scripts/qdrant_collection_info.py <collection>`.
