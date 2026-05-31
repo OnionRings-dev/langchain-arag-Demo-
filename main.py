@@ -15,6 +15,15 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from qdrant_client import QdrantClient, models
+from rich.columns import Columns
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.status import Status
+from rich.table import Table
+
+console = Console()
 
 
 class GraphState(TypedDict):
@@ -192,52 +201,101 @@ def build_graph():
     return graph_builder.compile(checkpointer=MemorySaver())
 
 
-def print_sources(docs: list[Document]) -> None:
+def display_documents(docs: list[Document]) -> None:
     if not docs:
-        print("Sources: none")
+        console.print("[yellow]No relevant documents found.[/yellow]")
         return
-    print("Sources:")
-    for index, doc in enumerate(docs, start=1):
-        source = (
+
+    table = Table(
+        title="Retrieved Documents",
+        show_header=True,
+        header_style="bold magenta",
+        expand=True,
+    )
+    table.add_column("#", style="dim", width=2)
+    table.add_column("Source", style="cyan", no_wrap=False, overflow="fold")
+    table.add_column("Content Snippet", style="white")
+
+    for i, doc in enumerate(docs, start=1):
+        source_val = (
             doc.metadata.get("source")
             or doc.metadata.get("url")
             or doc.metadata.get("file")
+            or "Unknown"
         )
-        label = source or "unknown"
-        print(f"  {index}. {label}")
+        # Create a clickable link if it's a URL
+        if str(source_val).startswith("http"):
+            source_display = f"[link={source_val}]{source_val}[/link]"
+        else:
+            source_display = str(source_val)
+
+        content = doc.page_content.replace("\n", " ")[:150] + "..."
+        table.add_row(str(i), source_display, content)
+
+    console.print(table)
 
 
 def main() -> None:
     load_dotenv()
-    graph = build_graph()
-    thread_id = get_env("THREAD_ID", "arag-cli")
-    show_sources = get_env("SHOW_SOURCES", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
-    print("ARAG terminal agent ready. Type 'exit' or 'quit' to stop.")
+    with console.status("[bold green]Building graph...", spinner="dots"):
+        graph = build_graph()
+
+    thread_id = get_env("THREAD_ID", "arag-cli")
+
+    console.print(
+        Panel.fit(
+            "[bold blue]ARAG Terminal Agent[/bold blue]\n[dim]Type 'exit' or 'quit' to stop.[/dim]",
+            border_style="blue",
+        )
+    )
+
     while True:
         try:
-            user_input = input("You> ").strip()
+            user_input = console.input("[bold green]You>[/bold green] ").strip()
         except EOFError:
-            print()
+            console.print()
             break
+
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit"}:
             break
 
-        result = graph.invoke(
-            {"messages": [HumanMessage(content=user_input)]},
-            config={"configurable": {"thread_id": thread_id}},
-        )
-        assistant_message = result["messages"][-1]
-        print(f"Assistant> {assistant_message.content}")
-        if show_sources:
-            print_sources(result.get("context", []))
+        # Use streaming to show "tool calls" (node executions)
+        with console.status(
+            "[bold yellow]Processing...", spinner="bouncingBar"
+        ) as status:
+            last_state = {}
+            for update in graph.stream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config={"configurable": {"thread_id": thread_id}},
+                stream_mode="updates",
+            ):
+                for node_name, state_update in update.items():
+                    if node_name == "retrieve":
+                        status.update(
+                            f"[bold cyan]Retrieved {len(state_update.get('context', []))} documents..."
+                        )
+                        last_state.update(state_update)
+                        console.print(f"\n[bold cyan]Step: {node_name}[/bold cyan]")
+                        display_documents(state_update.get("context", []))
+                    elif node_name == "generate":
+                        status.update("[bold magenta]Generating response...")
+                        last_state.update(state_update)
+                        console.print(f"[bold magenta]Step: {node_name}[/bold magenta]")
+
+            # After streaming is done, print the final message
+            if "messages" in last_state:
+                assistant_message = last_state["messages"][-1]
+                console.print(
+                    Panel(
+                        Markdown(assistant_message.content),
+                        title="[bold blue]Assistant[/bold blue]",
+                        border_style="blue",
+                        expand=False,
+                    )
+                )
 
 
 if __name__ == "__main__":
