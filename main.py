@@ -4,6 +4,7 @@ import os
 from typing import Annotated, Any, TypedDict
 
 from dotenv import load_dotenv
+from flashrank import Ranker, RerankRequest
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -97,7 +98,7 @@ def build_retriever() -> BaseRetriever:
     collection = get_collection_name()
     content_key = get_env("QDRANT_TEXT_KEY", "text")
     metadata_key = os.getenv("QDRANT_METADATA_KEY", "metadata")
-    top_k = int(get_env("TOP_K", "4"))
+    top_k = int(get_env("TOP_K", "20"))
 
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
 
@@ -168,6 +169,8 @@ def build_graph():
         model=get_env("GROQ_MODEL", "llama-3.1-8b-instant"),
         temperature=float(get_env("GROQ_TEMPERATURE", "0.2")),
     )
+    # Initialize Ranker once
+    ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -184,8 +187,31 @@ def build_graph():
 
     def retrieve(state: GraphState) -> dict[str, list[Document]]:
         question = latest_user_message(state["messages"])
+        # Fetch more for reranking (e.g., 20)
         docs = retriever.invoke(question)
         return {"context": docs}
+
+    def rerank(state: GraphState) -> dict[str, list[Document]]:
+        question = latest_user_message(state["messages"])
+        docs = state.get("context", [])
+        if not docs:
+            return {"context": []}
+
+        # Format for FlashRank
+        passages = [
+            {"id": i, "text": doc.page_content, "meta": doc.metadata}
+            for i, doc in enumerate(docs)
+        ]
+
+        rerank_request = RerankRequest(query=question, passages=passages)
+        results = ranker.rerank(rerank_request)
+
+        # Take top 5 after reranking
+        top_results = results[:5]
+        reranked_docs = [
+            Document(page_content=r["text"], metadata=r["meta"]) for r in top_results
+        ]
+        return {"context": reranked_docs}
 
     def generate(state: GraphState) -> dict[str, list[BaseMessage]]:
         context = format_docs(state.get("context", []))
@@ -194,10 +220,14 @@ def build_graph():
 
     graph_builder = StateGraph(GraphState)
     graph_builder.add_node("retrieve", retrieve)
+    graph_builder.add_node("rerank", rerank)
     graph_builder.add_node("generate", generate)
+
     graph_builder.add_edge(START, "retrieve")
-    graph_builder.add_edge("retrieve", "generate")
+    graph_builder.add_edge("retrieve", "rerank")
+    graph_builder.add_edge("rerank", "generate")
     graph_builder.add_edge("generate", END)
+
     return graph_builder.compile(checkpointer=MemorySaver())
 
 
@@ -275,10 +305,18 @@ def main() -> None:
                 for node_name, state_update in update.items():
                     if node_name == "retrieve":
                         status.update(
-                            f"[bold cyan]Retrieved {len(state_update.get('context', []))} documents..."
+                            f"[bold cyan]Retrieved {len(state_update.get('context', []))} raw documents..."
                         )
                         last_state.update(state_update)
-                        console.print(f"\n[bold cyan]Step: {node_name}[/bold cyan]")
+                        console.print(
+                            f"\n[bold cyan]Step: {node_name}[/bold cyan] (Fetched {len(state_update.get('context', []))} docs)"
+                        )
+                    elif node_name == "rerank":
+                        status.update("[bold yellow]Reranking documents...")
+                        last_state.update(state_update)
+                        console.print(
+                            f"[bold yellow]Step: {node_name}[/bold yellow] (Top 5 selected)"
+                        )
                         display_documents(state_update.get("context", []))
                     elif node_name == "generate":
                         status.update("[bold magenta]Generating response...")
