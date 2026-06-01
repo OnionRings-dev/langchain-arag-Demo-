@@ -1,24 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from dotenv import load_dotenv
 from flashrank import Ranker, RerankRequest
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_qdrant import QdrantVectorStore
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from qdrant_client import QdrantClient, models
-from rich.columns import Columns
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.status import Status
@@ -169,66 +170,103 @@ def build_graph():
         model=get_env("GROQ_MODEL", "llama-3.1-8b-instant"),
         temperature=float(get_env("GROQ_TEMPERATURE", "0.2")),
     )
+
     # Initialize Ranker once
     ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an ARAG terminal assistant. Answer the user using only the "
-                "retrieved context. If the answer is not in the context, say you do not know.",
-            ),
-            ("system", "Context:\n{context}"),
-            MessagesPlaceholder("messages"),
-        ]
-    )
-    chain = prompt | llm
+    @tool
+    def query_knowledge_base(query: str) -> str:
+        """Consult the knowledge base to get MORE information.
+        Use this ONLY if the initial context provided is not enough to answer the user's question.
+        """
+        # 1. Retrieve
+        docs = retriever.invoke(query)
+        if not docs:
+            return "No additional relevant documents found."
 
-    def retrieve(state: GraphState) -> dict[str, list[Document]]:
+        # 2. Rerank
+        passages = [
+            {"id": i, "text": doc.page_content, "meta": doc.metadata}
+            for i, doc in enumerate(docs)
+        ]
+        rerank_request = RerankRequest(query=query, passages=passages)
+        results = ranker.rerank(rerank_request)
+
+        top_results = results[:5]
+        formatted = []
+        for i, r in enumerate(top_results, start=1):
+            source = r["meta"].get("source") or r["meta"].get("url") or "Unknown"
+            formatted.append(f"Source [{i}]: {source}\nContent: {r['text']}")
+
+        return "\n\n".join(formatted)
+
+    tools = [query_knowledge_base]
+    llm_with_tools = llm.bind_tools(tools)
+
+    def retrieve(state: GraphState):
         question = latest_user_message(state["messages"])
-        # Fetch more for reranking (e.g., 20)
         docs = retriever.invoke(question)
         return {"context": docs}
 
-    def rerank(state: GraphState) -> dict[str, list[Document]]:
+    def rerank(state: GraphState):
         question = latest_user_message(state["messages"])
         docs = state.get("context", [])
         if not docs:
             return {"context": []}
 
-        # Format for FlashRank
         passages = [
             {"id": i, "text": doc.page_content, "meta": doc.metadata}
             for i, doc in enumerate(docs)
         ]
+        results = ranker.rerank(RerankRequest(query=question, passages=passages))
 
-        rerank_request = RerankRequest(query=question, passages=passages)
-        results = ranker.rerank(rerank_request)
-
-        # Take top 5 after reranking
-        top_results = results[:5]
         reranked_docs = [
-            Document(page_content=r["text"], metadata=r["meta"]) for r in top_results
+            Document(page_content=r["text"], metadata=r["meta"]) for r in results[:5]
         ]
-        return {"context": reranked_docs}
 
-    def generate(state: GraphState) -> dict[str, list[BaseMessage]]:
-        context = format_docs(state.get("context", []))
-        response = chain.invoke({"context": context, "messages": state["messages"]})
-        return {"messages": [response]}
+        # Inject initial context as a system message for the agent
+        initial_context = format_docs(reranked_docs)
+        context_msg = (
+            "system",
+            f"Initial Context from Knowledge Base:\n\n{initial_context}",
+        )
 
-    graph_builder = StateGraph(GraphState)
-    graph_builder.add_node("retrieve", retrieve)
-    graph_builder.add_node("rerank", rerank)
-    graph_builder.add_node("generate", generate)
+        return {"context": reranked_docs, "messages": [context_msg]}
 
-    graph_builder.add_edge(START, "retrieve")
-    graph_builder.add_edge("retrieve", "rerank")
-    graph_builder.add_edge("rerank", "generate")
-    graph_builder.add_edge("generate", END)
+    def agent(state: GraphState):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an ARAG terminal assistant. You have been provided with initial context. "
+                    "If the initial context is sufficient, answer directly. "
+                    "If you need more specific details, use the 'query_knowledge_base' tool. "
+                    "Always cite your sources using [Index] or the Source URL.",
+                ),
+                MessagesPlaceholder("messages"),
+            ]
+        )
+        chain = prompt | llm_with_tools
+        msg = chain.invoke(state["messages"])
+        return {"messages": [msg]}
 
-    return graph_builder.compile(checkpointer=MemorySaver())
+    def should_continue(state: GraphState) -> Literal["tools", END]:
+        last_message = state["messages"][-1]
+        return "tools" if last_message.tool_calls else END
+
+    workflow = StateGraph(GraphState)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("rerank", rerank)
+    workflow.add_node("agent", agent)
+    workflow.add_node("tools", ToolNode(tools))
+
+    workflow.add_edge(START, "retrieve")
+    workflow.add_edge("retrieve", "rerank")
+    workflow.add_edge("rerank", "agent")
+    workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile(checkpointer=MemorySaver())
 
 
 def display_documents(docs: list[Document]) -> None:
@@ -292,43 +330,49 @@ def main() -> None:
         if user_input.lower() in {"exit", "quit"}:
             break
 
-        # Use streaming to show "tool calls" (node executions)
+        # Use streaming to show "thoughts" and tool calls
         with console.status(
-            "[bold yellow]Processing...", spinner="bouncingBar"
+            "[bold yellow]Agent is thinking...", spinner="bouncingBar"
         ) as status:
-            last_state = {}
             for update in graph.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config={"configurable": {"thread_id": thread_id}},
                 stream_mode="updates",
             ):
                 for node_name, state_update in update.items():
-                    if node_name == "retrieve":
-                        status.update(
-                            f"[bold cyan]Retrieved {len(state_update.get('context', []))} raw documents..."
-                        )
-                        last_state.update(state_update)
-                        console.print(
-                            f"\n[bold cyan]Step: {node_name}[/bold cyan] (Fetched {len(state_update.get('context', []))} docs)"
-                        )
-                    elif node_name == "rerank":
-                        status.update("[bold yellow]Reranking documents...")
-                        last_state.update(state_update)
-                        console.print(
-                            f"[bold yellow]Step: {node_name}[/bold yellow] (Top 5 selected)"
-                        )
+                    if node_name == "rerank":
+                        # Initial RAG results
+                        console.print(f"\n[bold cyan]Step: Traditional RAG[/bold cyan]")
                         display_documents(state_update.get("context", []))
-                    elif node_name == "generate":
-                        status.update("[bold magenta]Generating response...")
-                        last_state.update(state_update)
-                        console.print(f"[bold magenta]Step: {node_name}[/bold magenta]")
+                    elif node_name == "agent":
+                        msg = state_update["messages"][-1]
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                console.print(
+                                    Panel(
+                                        f"[bold cyan]Tool:[/bold cyan] {tc['name']}\n[bold cyan]Args:[/bold cyan] {json.dumps(tc['args'], indent=2)}",
+                                        title="[bold yellow]Autonomous Expansion Search[/bold yellow]",
+                                        border_style="yellow",
+                                    )
+                                )
+                        elif msg.content:
+                            # This is the final answer or a partial thought
+                            pass
+                    elif node_name == "tools":
+                        # Tool execution finished
+                        status.update(
+                            "[bold green]Analyzing additional search results..."
+                        )
 
-            # After streaming is done, print the final message
-            if "messages" in last_state:
-                assistant_message = last_state["messages"][-1]
+            # Final state retrieval to show the answer
+            final_state = graph.get_state(
+                config={"configurable": {"thread_id": thread_id}}
+            )
+            last_message = final_state.values["messages"][-1]
+            if last_message.content:
                 console.print(
                     Panel(
-                        Markdown(assistant_message.content),
+                        Markdown(last_message.content),
                         title="[bold blue]Assistant[/bold blue]",
                         border_style="blue",
                         expand=False,
