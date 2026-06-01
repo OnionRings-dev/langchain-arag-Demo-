@@ -4,25 +4,30 @@ import json
 import os
 from typing import Annotated, Any, Literal, TypedDict
 
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
+
 from dotenv import load_dotenv
 from flashrank import Ranker, RerankRequest
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_qdrant import QdrantVectorStore
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from pydantic import SecretStr
 from qdrant_client import QdrantClient, models
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.status import Status
 from rich.table import Table
 
 console = Console()
@@ -30,7 +35,7 @@ console = Console()
 
 class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    context: list[Document]
+    context: NotRequired[list[Document]]
 
 
 class UniCrawlerVectorStore(QdrantVectorStore):
@@ -134,7 +139,7 @@ def build_retriever() -> BaseRetriever:
         metadata_payload_key=metadata_key,
     )
 
-    search_kwargs = {"k": top_k}
+    search_kwargs: dict[str, Any] = {"k": top_k}
     if qdrant_filter:
         search_kwargs["filter"] = qdrant_filter
 
@@ -167,14 +172,16 @@ def format_docs(docs: list[Document]) -> str:
 def latest_user_message(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if message.type == "human":
-            return message.content
+            if isinstance(message.content, str):
+                return message.content
+            return str(message.content)
     raise ValueError("No user message found in conversation state.")
 
 
 def build_graph():
     retriever = build_retriever()
     llm = ChatGroq(
-        api_key=get_env("GROQ_API_KEY", required=True),
+        api_key=SecretStr(get_env("GROQ_API_KEY", required=True)),
         model=get_env("GROQ_MODEL", "llama-3.1-8b-instant"),
         temperature=float(get_env("GROQ_TEMPERATURE", "0.2")),
     )
@@ -266,12 +273,14 @@ def build_graph():
             ]
         )
         chain = prompt | llm_with_tools
-        msg = chain.invoke(state["messages"])
+        msg = chain.invoke({"messages": state["messages"]})
         return {"messages": [msg]}
 
-    def should_continue(state: GraphState) -> Literal["tools", END]:
+    def should_continue(state: GraphState) -> Literal["tools", "__end__"]:
         last_message = state["messages"][-1]
-        return "tools" if last_message.tool_calls else END
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            return "tools"
+        return "__end__"
 
     workflow = StateGraph(GraphState)
     workflow.add_node("retrieve", retrieve)
@@ -361,11 +370,11 @@ def main() -> None:
                 for node_name, state_update in update.items():
                     if node_name == "rerank":
                         # Initial RAG results
-                        console.print(f"\n[bold cyan]Step: Traditional RAG[/bold cyan]")
+                        console.print("\n[bold cyan]Step: Traditional RAG[/bold cyan]")
                         display_documents(state_update.get("context", []))
                     elif node_name == "agent":
                         msg = state_update["messages"][-1]
-                        if msg.tool_calls:
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
                             for tc in msg.tool_calls:
                                 console.print(
                                     Panel(
@@ -388,10 +397,13 @@ def main() -> None:
                 config={"configurable": {"thread_id": thread_id}}
             )
             last_message = final_state.values["messages"][-1]
-            if last_message.content:
+            content = last_message.content
+            if content:
+                if not isinstance(content, str):
+                    content = str(content)
                 console.print(
                     Panel(
-                        Markdown(last_message.content),
+                        Markdown(content),
                         title="[bold blue]Assistant[/bold blue]",
                         border_style="blue",
                         expand=False,
