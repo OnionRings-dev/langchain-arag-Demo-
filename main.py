@@ -151,7 +151,15 @@ def format_docs(docs: list[Document]) -> str:
             or doc.metadata.get("url")
             or doc.metadata.get("file")
         )
-        header = f"[{index}] {source}".strip() if source else f"[{index}]"
+        # Use Markdown link for source if it's a URL
+        if str(source).startswith("http"):
+            source_display = f"[{source}]({source})"
+        else:
+            source_display = str(source)
+
+        header = (
+            f"[{index}] {source_display}".strip() if source_display else f"[{index}]"
+        )
         formatted.append(f"{header}\n{doc.page_content}")
     return "\n\n".join(formatted)
 
@@ -193,10 +201,16 @@ def build_graph():
         results = ranker.rerank(rerank_request)
 
         top_results = results[:5]
+        # Format for LLM
         formatted = []
         for i, r in enumerate(top_results, start=1):
             source = r["meta"].get("source") or r["meta"].get("url") or "Unknown"
-            formatted.append(f"Source [{i}]: {source}\nContent: {r['text']}")
+            # Use Markdown link syntax for the tool output to encourage LLM to copy it
+            if str(source).startswith("http"):
+                source_link = f"[{source}]({source})"
+            else:
+                source_link = source
+            formatted.append(f"Source [{i}]: {source_link}\nContent: {r['text']}")
 
         return "\n\n".join(formatted)
 
@@ -243,9 +257,10 @@ def build_graph():
                     "If you need more specific details, use the 'query_knowledge_base' tool. "
                     "\n\nSTRICT CITATION RULES:\n"
                     "1. Every claim must be cited inline using the format [Index] (e.g., [1]).\n"
-                    "2. At the end of your response, ALWAYS include a 'Sources:' section listing the full URLs or source names used.\n"
-                    "3. If multiple sources are used, list them all.\n"
-                    "4. Use the Source information provided in the context blocks.",
+                    "2. At the end of your response, ALWAYS include a 'Sources:' section listing the sources used.\n"
+                    "3. Format each source as a Markdown link: [Source Name or URL](URL). This is CRITICAL for terminal clickability.\n"
+                    "4. If multiple sources are used, list them all.\n"
+                    "5. Use the Source information provided in the context blocks.",
                 ),
                 MessagesPlaceholder("messages"),
             ]
